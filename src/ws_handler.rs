@@ -5,11 +5,15 @@ use futures_util::{SinkExt, StreamExt};
 use sherpa_rs::sense_voice::SenseVoiceRecognizer;
 use tracing::{debug, info, warn};
 
-use crate::asr::{spawn_asr_thread, AsrResult, AudioMsg};
+use crate::asr::{spawn_asr_thread, AsrConfig, AsrResult, AudioMsg};
 use crate::protocol::{ClientMessage, ServerMessage};
 
-pub async fn handle_socket(socket: WebSocket, recognizer: Arc<Mutex<SenseVoiceRecognizer>>) {
-    let (audio_tx, mut result_rx) = spawn_asr_thread(recognizer);
+pub async fn handle_socket(
+    socket: WebSocket,
+    recognizer: Arc<Mutex<SenseVoiceRecognizer>>,
+    asr_config: AsrConfig,
+) {
+    let (audio_tx, mut result_rx) = spawn_asr_thread(recognizer, asr_config);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     match result_rx.recv().await {

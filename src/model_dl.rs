@@ -16,15 +16,16 @@ const ARCHIVE_NAME: &str =
 
 /// Returns ready-to-use model paths, downloading the default bundle if needed.
 ///
-/// Resolution order:
-///   1. `MODEL_PATH` / `TOKENS_PATH` env vars, if set and files exist → use as-is.
-///   2. Otherwise, download the default paraformer-zh bundle to `models/` and
-///      return the paths inside it.
-pub fn ensure_model_paths(num_threads: i32) -> Result<ModelPaths> {
-    let model = std::env::var("MODEL_PATH")
-        .unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
-    let tokens = std::env::var("TOKENS_PATH")
-        .unwrap_or_else(|_| DEFAULT_TOKENS_PATH.to_string());
+/// `model_path` / `tokens_path` come from the resolved config (already merged
+/// with env vars and JSON file). If both point to existing files, no download
+/// occurs. Otherwise the default SenseVoice bundle is fetched into `models/`.
+pub fn ensure_model_paths(
+    num_threads: i32,
+    model_path: Option<String>,
+    tokens_path: Option<String>,
+) -> Result<ModelPaths> {
+    let model = model_path.unwrap_or_else(|| DEFAULT_MODEL_PATH.to_string());
+    let tokens = tokens_path.unwrap_or_else(|| DEFAULT_TOKENS_PATH.to_string());
 
     if Path::new(&model).exists() && Path::new(&tokens).exists() {
         return Ok(ModelPaths { model, tokens, num_threads });

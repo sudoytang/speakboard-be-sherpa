@@ -1,4 +1,5 @@
 mod asr;
+mod config;
 mod model_dl;
 mod protocol;
 mod ws_handler;
@@ -15,12 +16,13 @@ use sherpa_rs::sense_voice::SenseVoiceRecognizer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use asr::load_recognizer;
+use asr::{AsrConfig, load_recognizer};
 use ws_handler::handle_socket;
 
 #[derive(Clone)]
 struct AppState {
     recognizer: Arc<Mutex<SenseVoiceRecognizer>>,
+    asr_config: AsrConfig,
 }
 
 async fn ws_route(
@@ -28,12 +30,11 @@ async fn ws_route(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let recognizer = Arc::clone(&state.recognizer);
-    ws.on_upgrade(move |socket| handle_socket(socket, recognizer))
+    let asr_config = state.asr_config.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, recognizer, asr_config))
 }
 
 fn main() {
-    // Default: our crate at debug, noisy dependencies at info.
-    // Override with RUST_LOG env var, e.g. RUST_LOG=trace cargo run
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info,speakboard_be_sherpa=debug")
     });
@@ -41,23 +42,29 @@ fn main() {
         .with_env_filter(filter)
         .init();
 
-    let num_threads: i32 = std::env::var("NUM_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let cfg = config::load(config::parse_config_path().as_deref())
+        .expect("Failed to load config");
 
     // Ensure model files are on disk (download if missing).
-    let paths = model_dl::ensure_model_paths(num_threads)
-        .expect("Failed to prepare model files");
+    let paths = model_dl::ensure_model_paths(
+        cfg.num_threads,
+        cfg.model_path.clone(),
+        cfg.tokens_path.clone(),
+    )
+    .expect("Failed to prepare model files");
 
     // Load the model into memory once, before accepting any connections.
     info!("Loading ASR model...");
     let recognizer = load_recognizer(&paths).expect("Failed to load ASR model");
     info!("ASR model loaded.");
 
-    let state = AppState { recognizer: Arc::new(Mutex::new(recognizer)) };
+    let asr_config = AsrConfig::from_resolved(&cfg);
+    let state = AppState {
+        recognizer: Arc::new(Mutex::new(recognizer)),
+        asr_config,
+    };
 
+    let port = cfg.port;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -65,7 +72,7 @@ fn main() {
         .block_on(serve(state, port));
 }
 
-async fn serve(state: AppState, port: String) {
+async fn serve(state: AppState, port: u16) {
     let app = Router::new()
         .route("/ws", get(ws_route))
         .with_state(state);

@@ -4,27 +4,39 @@ use sherpa_rs::sense_voice::SenseVoiceRecognizer;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace};
 
+/// The model always expects 16 kHz mono audio.
 const SAMPLE_RATE: u32 = 16_000;
-const SILENCE_RMS_THRESHOLD: f32 = 0.02;
 
-/// 0.8 s of consecutive silence → send a quick partial result.
-const PARTIAL_SILENCE_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.8) as usize;
+/// Runtime-tunable ASR parameters, derived from [`crate::config::ResolvedConfig`].
+/// All time values are pre-converted to sample counts for hot-path efficiency.
+#[derive(Debug, Clone)]
+pub struct AsrConfig {
+    pub silence_rms_threshold: f32,
+    /// 0.8 s → quick partial result.
+    pub partial_silence_samples: usize,
+    /// 2.0 s → accurate gold result.
+    pub gold_silence_samples: usize,
+    /// 30 s hard cap on the gold accumulation buffer.
+    pub max_gold_samples: usize,
+    /// Minimum audio sent to the model (avoids ONNX shape errors).
+    pub min_transcribe_samples: usize,
+    /// Minimum real speech in an utterance before attempting transcription.
+    pub min_speech_samples: usize,
+}
 
-/// 2.0 s of consecutive silence → send the accurate gold result.
-const GOLD_SILENCE_SAMPLES: usize = (SAMPLE_RATE as f64 * 2.0) as usize;
-
-/// Hard cap on the gold accumulation buffer.
-/// If reached mid-speech, a scored split point is chosen and the left half is
-/// flushed as a gold result; the right half continues as the new buffer.
-const MAX_GOLD_SAMPLES: usize = SAMPLE_RATE as usize * 30;
-
-/// Minimum audio length for a transcription call (avoids ONNX shape errors on
-/// very short inputs whose downsampled frame count rounds to zero).
-const MIN_TRANSCRIBE_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
-
-/// Minimum real speech (non-silence) in an utterance before we attempt
-/// transcription. Prevents brief noise spikes from producing hallucinations.
-const MIN_SPEECH_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.3) as usize; // 0.3 s
+impl AsrConfig {
+    pub fn from_resolved(c: &crate::config::ResolvedConfig) -> Self {
+        let sr = SAMPLE_RATE as f64;
+        Self {
+            silence_rms_threshold: c.silence_rms_threshold,
+            partial_silence_samples: (sr * c.partial_silence_secs) as usize,
+            gold_silence_samples: (sr * c.gold_silence_secs) as usize,
+            max_gold_samples: (sr * c.max_gold_secs) as usize,
+            min_transcribe_samples: (sr * c.min_transcribe_secs) as usize,
+            min_speech_samples: (sr * c.min_speech_secs) as usize,
+        }
+    }
+}
 
 pub enum AudioMsg {
     Samples(Vec<f32>),
@@ -68,10 +80,11 @@ pub fn load_recognizer(paths: &ModelPaths) -> anyhow::Result<SenseVoiceRecognize
 /// Spawn a dedicated OS thread for the ASR pipeline and return its channels.
 pub fn spawn_asr_thread(
     recognizer: Arc<Mutex<SenseVoiceRecognizer>>,
+    config: AsrConfig,
 ) -> (mpsc::Sender<AudioMsg>, mpsc::Receiver<AsrResult>) {
     let (audio_tx, audio_rx) = mpsc::channel::<AudioMsg>(128);
     let (result_tx, result_rx) = mpsc::channel::<AsrResult>(32);
-    std::thread::spawn(move || run_asr(recognizer, audio_rx, result_tx));
+    std::thread::spawn(move || run_asr(recognizer, audio_rx, result_tx, config));
     (audio_tx, result_rx)
 }
 
@@ -85,10 +98,11 @@ fn rms(samples: &[f32]) -> f32 {
 fn transcribe(
     recognizer: &Arc<Mutex<SenseVoiceRecognizer>>,
     audio: &[f32],
+    min_transcribe_samples: usize,
 ) -> Option<TranscribeOutput> {
     let dur_s = audio.len() as f32 / SAMPLE_RATE as f32;
-    if audio.len() < MIN_TRANSCRIBE_SAMPLES {
-        debug!("transcribe: skipped (too short: {dur_s:.2}s < 0.5s)");
+    if audio.len() < min_transcribe_samples {
+        debug!("transcribe: skipped (too short: {dur_s:.2}s)");
         return None;
     }
     debug!("transcribe: calling model on {dur_s:.2}s of audio …");
@@ -130,6 +144,7 @@ fn run_asr(
     recognizer: Arc<Mutex<SenseVoiceRecognizer>>,
     mut audio_rx: mpsc::Receiver<AudioMsg>,
     result_tx: mpsc::Sender<AsrResult>,
+    cfg: AsrConfig,
 ) {
     let _ = result_tx.blocking_send(AsrResult::Ready);
 
@@ -160,9 +175,9 @@ fn run_asr(
 
     info!(
         "ASR thread started (partial={:.1}s  gold={:.1}s  cap={:.0}s)",
-        PARTIAL_SILENCE_SAMPLES as f32 / SAMPLE_RATE as f32,
-        GOLD_SILENCE_SAMPLES as f32 / SAMPLE_RATE as f32,
-        MAX_GOLD_SAMPLES as f32 / SAMPLE_RATE as f32,
+        cfg.partial_silence_samples as f32 / SAMPLE_RATE as f32,
+        cfg.gold_silence_samples as f32 / SAMPLE_RATE as f32,
+        cfg.max_gold_samples as f32 / SAMPLE_RATE as f32,
     );
 
     let mut chunk_count: u64 = 0;
@@ -171,7 +186,7 @@ fn run_asr(
         match audio_rx.blocking_recv() {
             Some(AudioMsg::Samples(samples)) => {
                 let energy = rms(&samples);
-                let is_speech = energy > SILENCE_RMS_THRESHOLD;
+                let is_speech = energy > cfg.silence_rms_threshold;
                 chunk_count += 1;
 
                 // Print a status line every 50 chunks (~1.6 s at typical rates).
@@ -214,13 +229,13 @@ fn run_asr(
                     silence_samples = 0;
                     partial_fired = false;
 
-                    // Hard cap: force-flush if gold_buffer exceeds 30 s.
-                    if gold_buffer.len() >= MAX_GOLD_SAMPLES {
+                    // Hard cap: force-flush if gold_buffer exceeds the cap.
+                    if gold_buffer.len() >= cfg.max_gold_samples {
                         let split = best_split(&silence_regions, gold_buffer.len());
                         info!("force-split at {:.2}s", split as f32 / SAMPLE_RATE as f32);
                         let right = gold_buffer[split..].to_vec();
 
-                        if let Some(out) = transcribe(&recognizer, &gold_buffer[..split]) {
+                        if let Some(out) = transcribe(&recognizer, &gold_buffer[..split], cfg.min_transcribe_samples) {
                             let split_rms = (speech_energy_sum
                                 / speech_samples_in_utterance.max(1) as f64)
                                 .sqrt() as f32;
@@ -254,18 +269,18 @@ fn run_asr(
                     gold_buffer.extend_from_slice(&samples);
                     silence_samples += samples.len();
 
-                    // 0.8 s threshold → partial
-                    if silence_samples >= PARTIAL_SILENCE_SAMPLES && !partial_fired {
+                    // partial threshold
+                    if silence_samples >= cfg.partial_silence_samples && !partial_fired {
                         let sil_s = silence_samples as f32 / SAMPLE_RATE as f32;
                         let utt_s = (gold_buffer.len() - utterance_start) as f32 / SAMPLE_RATE as f32;
                         let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
                         info!("PARTIAL threshold hit  silence={sil_s:.2}s  utterance={utt_s:.2}s  speech={speech_s:.2}s");
-                        if speech_samples_in_utterance >= MIN_SPEECH_SAMPLES {
+                        if speech_samples_in_utterance >= cfg.min_speech_samples {
                             let utterance_rms = (speech_energy_sum
                                 / speech_samples_in_utterance as f64)
                                 .sqrt() as f32;
                             let utterance_audio = &gold_buffer[utterance_start..];
-                            if let Some(out) = transcribe(&recognizer, utterance_audio) {
+                            if let Some(out) = transcribe(&recognizer, utterance_audio, cfg.min_transcribe_samples) {
                                 let id = format!("p{partial_seq}");
                                 partial_seq += 1;
                                 info!(
@@ -280,14 +295,14 @@ fn run_asr(
                                 });
                             }
                         } else {
-                            debug!("PARTIAL skipped: speech too short ({speech_s:.2}s < 0.3s), likely noise");
+                            debug!("PARTIAL skipped: speech too short ({speech_s:.2}s), likely noise");
                         }
                         in_speech = false;
                         partial_fired = true;
                     }
 
-                    // 2.0 s threshold → gold (replaces all partials in this window)
-                    if silence_samples >= GOLD_SILENCE_SAMPLES {
+                    // gold threshold
+                    if silence_samples >= cfg.gold_silence_samples {
                         let sil_s = silence_samples as f32 / SAMPLE_RATE as f32;
                         let gold_s = gold_buffer.len() as f32 / SAMPLE_RATE as f32;
                         let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
@@ -295,11 +310,11 @@ fn run_asr(
                         if let Some(start) = open_silence.take() {
                             silence_regions.push((start, gold_buffer.len()));
                         }
-                        if speech_samples_in_utterance >= MIN_SPEECH_SAMPLES {
+                        if speech_samples_in_utterance >= cfg.min_speech_samples {
                             let utterance_rms = (speech_energy_sum
                                 / speech_samples_in_utterance as f64)
                                 .sqrt() as f32;
-                            if let Some(out) = transcribe(&recognizer, &gold_buffer) {
+                            if let Some(out) = transcribe(&recognizer, &gold_buffer, cfg.min_transcribe_samples) {
                                 info!(
                                     "→ sending GoldReplace  lang={}  rms={utterance_rms:.4}  text=\"{}\"",
                                     out.lang, out.text
@@ -311,7 +326,7 @@ fn run_asr(
                                 });
                             }
                         } else {
-                            debug!("GOLD skipped: speech too short ({speech_s:.2}s < 0.3s), likely noise");
+                            debug!("GOLD skipped: speech too short ({speech_s:.2}s), likely noise");
                         }
                         gold_buffer.clear();
                         silence_regions.clear();
@@ -338,12 +353,12 @@ fn run_asr(
                 }
                 if !gold_buffer.is_empty() {
                     let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
-                    if speech_samples_in_utterance >= MIN_SPEECH_SAMPLES {
+                    if speech_samples_in_utterance >= cfg.min_speech_samples {
                         let utterance_rms = (speech_energy_sum
                             / speech_samples_in_utterance as f64)
                             .sqrt() as f32;
                         info!("flushing remaining {gold_s:.2}s as final gold");
-                        if let Some(out) = transcribe(&recognizer, &gold_buffer) {
+                        if let Some(out) = transcribe(&recognizer, &gold_buffer, cfg.min_transcribe_samples) {
                             info!(
                                 "→ sending GoldReplace (flush)  lang={}  rms={utterance_rms:.4}  text=\"{}\"",
                                 out.lang, out.text
@@ -355,7 +370,7 @@ fn run_asr(
                             });
                         }
                     } else {
-                        debug!("flush skipped: speech too short ({speech_s:.2}s < 0.3s)");
+                        debug!("flush skipped: speech too short ({speech_s:.2}s)");
                     }
                 }
                 break;
