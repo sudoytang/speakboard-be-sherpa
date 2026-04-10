@@ -3,12 +3,22 @@ use serde::Deserialize;
 use anyhow::{Context, Result};
 use tracing::info;
 
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    #[default]
+    UnixDomainSocket,
+    LoopbackTcp,
+}
+
 /// JSON schema for the on-disk config file.
 /// Every field is optional; missing fields fall back to the built-in defaults.
 ///
 /// Example file:
 /// ```json
 /// {
+///   "transport": "unix_domain_socket",
+///   "socket_path": "/var/folders/.../speakboard-sidecar.sock",
 ///   "port": 8080,
 ///   "num_threads": 4,
 ///   "silence_rms_threshold": 0.02,
@@ -22,7 +32,9 @@ use tracing::info;
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigFile {
+    pub transport: Option<TransportKind>,
     pub port: Option<u16>,
+    pub socket_path: Option<String>,
     pub num_threads: Option<i32>,
     /// Override model .onnx path (skips auto-download when set).
     pub model_path: Option<String>,
@@ -41,7 +53,9 @@ pub struct ConfigFile {
 /// Built from a ConfigFile merged with env-var overrides and built-in defaults.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    pub transport: TransportKind,
     pub port: u16,
+    pub socket_path: String,
     pub num_threads: i32,
     pub model_path: Option<String>,
     pub tokens_path: Option<String>,
@@ -57,7 +71,9 @@ pub struct ResolvedConfig {
 impl Default for ResolvedConfig {
     fn default() -> Self {
         Self {
+            transport: TransportKind::UnixDomainSocket,
             port: 8080,
+            socket_path: default_socket_path(),
             num_threads: 4,
             model_path: None,
             tokens_path: None,
@@ -91,7 +107,13 @@ pub fn load(path: Option<&str>) -> Result<ResolvedConfig> {
     let defaults = ResolvedConfig::default();
 
     let resolved = ResolvedConfig {
+        transport: env_transport("TRANSPORT")
+            .unwrap_or(file.transport.unwrap_or(defaults.transport)),
         port: env_u16("PORT").unwrap_or(file.port.unwrap_or(defaults.port)),
+        socket_path: std::env::var("SOCKET_PATH")
+            .ok()
+            .or(file.socket_path)
+            .unwrap_or(defaults.socket_path),
         num_threads: env_i32("NUM_THREADS")
             .unwrap_or(file.num_threads.unwrap_or(defaults.num_threads)),
         model_path: std::env::var("MODEL_PATH")
@@ -116,11 +138,15 @@ pub fn load(path: Option<&str>) -> Result<ResolvedConfig> {
         min_speech_secs: file.min_speech_secs.unwrap_or(defaults.min_speech_secs),
     };
 
+    let endpoint = match resolved.transport {
+        TransportKind::UnixDomainSocket => format!("unix://{}", resolved.socket_path),
+        TransportKind::LoopbackTcp => format!("tcp://127.0.0.1:{}", resolved.port),
+    };
     info!(
-        "Config: port={} threads={} rms_thresh={:.3} \
+        "Config: endpoint={} threads={} rms_thresh={:.3} \
          partial={:.1}s gold={:.1}s max={:.0}s \
          min_transcribe={:.2}s min_speech={:.2}s",
-        resolved.port,
+        endpoint,
         resolved.num_threads,
         resolved.silence_rms_threshold,
         resolved.partial_silence_secs,
@@ -146,4 +172,19 @@ fn env_u16(key: &str) -> Option<u16> {
 
 fn env_i32(key: &str) -> Option<i32> {
     std::env::var(key).ok()?.parse().ok()
+}
+
+fn env_transport(key: &str) -> Option<TransportKind> {
+    match std::env::var(key).ok()?.as_str() {
+        "unix_domain_socket" => Some(TransportKind::UnixDomainSocket),
+        "loopback_tcp" => Some(TransportKind::LoopbackTcp),
+        _ => None,
+    }
+}
+
+fn default_socket_path() -> String {
+    std::env::temp_dir()
+        .join("speakboard-sidecar.sock")
+        .display()
+        .to_string()
 }

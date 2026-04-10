@@ -1,15 +1,23 @@
 use std::env;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::{self, Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+use serde::Deserialize;
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 enum ParentEvent {
     Disconnected,
     ReadError(io::Error),
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    socket_path: Option<String>,
 }
 
 fn main() {
@@ -31,6 +39,7 @@ fn run() -> io::Result<()> {
     };
 
     let child_args: Vec<_> = args.collect();
+    let socket_path = socket_path_from_args(&child_args);
 
     let mut child = Command::new(&program)
         .args(&child_args)
@@ -46,6 +55,7 @@ fn run() -> io::Result<()> {
 
     loop {
         if let Some(status) = child.try_wait()? {
+            cleanup_socket_file(socket_path.as_ref());
             exit_with_status(status);
         }
 
@@ -56,6 +66,7 @@ fn run() -> io::Result<()> {
                     child.id()
                 );
                 terminate_child(&mut child)?;
+                cleanup_socket_file(socket_path.as_ref());
                 return Ok(());
             }
             Ok(ParentEvent::ReadError(err)) => {
@@ -64,6 +75,7 @@ fn run() -> io::Result<()> {
                     child.id()
                 );
                 terminate_child(&mut child)?;
+                cleanup_socket_file(socket_path.as_ref());
                 return Ok(());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -73,6 +85,7 @@ fn run() -> io::Result<()> {
                     child.id()
                 );
                 terminate_child(&mut child)?;
+                cleanup_socket_file(socket_path.as_ref());
                 return Ok(());
             }
         }
@@ -121,4 +134,28 @@ fn exit_with_status(status: ExitStatus) -> ! {
     }
 
     process::exit(status.code().unwrap_or(1));
+}
+
+fn socket_path_from_args(args: &[std::ffi::OsString]) -> Option<PathBuf> {
+    let config_path = parse_config_path(args)?;
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let cfg: ConfigFile = serde_json::from_str(&text).ok()?;
+    cfg.socket_path.map(PathBuf::from)
+}
+
+fn parse_config_path(args: &[std::ffi::OsString]) -> Option<&std::ffi::OsStr> {
+    let pos = args.iter().position(|arg| arg == "--config")?;
+    args.get(pos + 1).map(|arg| arg.as_os_str())
+}
+
+fn cleanup_socket_file(path: Option<&PathBuf>) {
+    let Some(path) = path else { return };
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "[wrapper] failed to remove socket file {}: {err}",
+            path.display()
+        );
+    }
 }
