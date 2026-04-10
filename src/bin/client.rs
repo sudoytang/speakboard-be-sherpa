@@ -2,13 +2,15 @@
 ///
 /// Usage:
 ///   cargo run --bin client [-- --debug]
+///   cargo run --bin client [-- --tcp 8080]
+///   cargo run --bin client [-- --socket /tmp/speakboard-sidecar.sock]
 ///
 /// Controls:
 ///   SPACE / ENTER  — start recording (connects to server, opens mic)
 ///   SPACE / ENTER  — stop recording (flushes audio, waits for final results)
 ///   Q / ESC        — quit
 
-use std::{io::Write, time::Duration};
+use std::{env, io::Write, time::Duration};
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,15 +18,65 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 
-const WS_URL: &str = "ws://127.0.0.1:8080/ws";
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+const FRAME_JSON: u8 = 1;
+const FRAME_AUDIO: u8 = 2;
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 
-// ── Protocol ────────────────────────────────────────────────────────────────
+#[derive(Clone)]
+enum ClientEndpoint {
+    LoopbackTcp(u16),
+    #[cfg(unix)]
+    UnixSocket(String),
+}
+
+impl ClientEndpoint {
+    fn from_args() -> Self {
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--tcp" => {
+                    if let Some(port) = args.next().and_then(|value| value.parse().ok()) {
+                        return Self::LoopbackTcp(port);
+                    }
+                }
+                "--socket" => {
+                    #[cfg(unix)]
+                    if let Some(path) = args.next() {
+                        return Self::UnixSocket(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            Self::UnixSocket(default_socket_path())
+        }
+        #[cfg(not(unix))]
+        {
+            Self::LoopbackTcp(8080)
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::LoopbackTcp(port) => format!("tcp://127.0.0.1:{port}"),
+            #[cfg(unix)]
+            Self::UnixSocket(path) => format!("unix://{path}"),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -36,15 +88,10 @@ enum ServerMsg {
     Unknown,
 }
 
-/// Messages forwarded from the WS I/O task to the display loop.
 enum TranscriptMsg {
-    /// Provisional text — shown in brackets, will likely be replaced.
     Partial { text: String, lang: String, rms: f32 },
-    /// Authoritative text — replaces all pending partials.
     Gold { text: String, lang: String, rms: f32 },
 }
-
-// ── Session ──────────────────────────────────────────────────────────────────
 
 struct Session {
     _stream: cpal::Stream,
@@ -57,31 +104,68 @@ impl Session {
     }
 }
 
-async fn start_session(transcript_tx: mpsc::Sender<TranscriptMsg>) -> Result<Session> {
-    // ── Connect to server ─────────────────────────────────────────────────
-    let (ws_stream, _) = connect_async(WS_URL)
-        .await
-        .context("Could not connect — is the server running?")?;
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+enum ClientStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
 
-    // Wait for the {"type":"ready"} handshake
+async fn start_session(
+    endpoint: ClientEndpoint,
+    transcript_tx: mpsc::Sender<TranscriptMsg>,
+) -> Result<Session> {
+    match connect_stream(&endpoint).await? {
+        ClientStream::Tcp(stream) => start_session_on_stream(stream, transcript_tx).await,
+        #[cfg(unix)]
+        ClientStream::Unix(stream) => start_session_on_stream(stream, transcript_tx).await,
+    }
+}
+
+async fn connect_stream(endpoint: &ClientEndpoint) -> Result<ClientStream> {
+    match endpoint {
+        ClientEndpoint::LoopbackTcp(port) => {
+            let stream = TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .context("Could not connect to loopback TCP server")?;
+            Ok(ClientStream::Tcp(stream))
+        }
+        #[cfg(unix)]
+        ClientEndpoint::UnixSocket(path) => {
+            let stream = UnixStream::connect(path)
+                .await
+                .with_context(|| format!("Could not connect to unix socket: {path}"))?;
+            Ok(ClientStream::Unix(stream))
+        }
+    }
+}
+
+async fn start_session_on_stream<S>(
+    stream: S,
+    transcript_tx: mpsc::Sender<TranscriptMsg>,
+) -> Result<Session>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = io::split(stream);
+
     loop {
-        match ws_rx.next().await {
-            Some(Ok(Message::Text(text))) => {
+        match read_frame(&mut reader).await? {
+            Some((FRAME_JSON, payload)) => {
+                let text = String::from_utf8(payload).context("Server sent invalid UTF-8")?;
                 if let Ok(ServerMsg::Ready) = serde_json::from_str(&text) {
                     break;
                 }
             }
-            Some(Ok(_)) => {}
-            _ => anyhow::bail!("Server closed connection before sending ready"),
+            Some(_) => {}
+            None => anyhow::bail!("Server closed connection before sending ready"),
         }
     }
 
-    // ── Channels ──────────────────────────────────────────────────────────
+    write_json_frame(&mut writer, br#"{"type":"start"}"#).await?;
+
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
 
-    // ── WS I/O task ───────────────────────────────────────────────────────
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -89,31 +173,33 @@ async fn start_session(transcript_tx: mpsc::Sender<TranscriptMsg>) -> Result<Ses
 
                 _ = &mut stop_rx => {
                     while let Ok(bytes) = audio_rx.try_recv() {
-                        if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                        if write_frame(&mut writer, FRAME_AUDIO, &bytes).await.is_err() {
                             return;
                         }
                     }
-                    let _ = ws_tx
-                        .send(Message::Text(r#"{"type":"stop"}"#.to_string().into()))
-                        .await;
-                    while let Some(Ok(Message::Text(text))) = ws_rx.next().await {
-                        forward_msg(&text, &transcript_tx).await;
+                    let _ = write_json_frame(&mut writer, br#"{"type":"stop"}"#).await;
+                    while let Ok(Some((FRAME_JSON, payload))) = read_frame(&mut reader).await {
+                        if let Ok(text) = String::from_utf8(payload) {
+                            forward_msg(&text, &transcript_tx).await;
+                        }
                     }
                     return;
                 }
 
                 Some(bytes) = audio_rx.recv() => {
-                    if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                    if write_frame(&mut writer, FRAME_AUDIO, &bytes).await.is_err() {
                         return;
                     }
                 }
 
-                msg = ws_rx.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            forward_msg(&text, &transcript_tx).await;
+                frame = read_frame(&mut reader) => {
+                    match frame {
+                        Ok(Some((FRAME_JSON, payload))) => {
+                            if let Ok(text) = String::from_utf8(payload) {
+                                forward_msg(&text, &transcript_tx).await;
+                            }
                         }
-                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                        Ok(None) | Err(_) => return,
                         _ => {}
                     }
                 }
@@ -121,7 +207,6 @@ async fn start_session(transcript_tx: mpsc::Sender<TranscriptMsg>) -> Result<Ses
         }
     });
 
-    // ── Microphone ────────────────────────────────────────────────────────
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -162,14 +247,18 @@ async fn start_session(transcript_tx: mpsc::Sender<TranscriptMsg>) -> Result<Ses
 
     stream.play().context("Failed to start microphone stream")?;
 
-    Ok(Session { _stream: stream, stop_tx })
+    Ok(Session {
+        _stream: stream,
+        stop_tx,
+    })
 }
 
-/// Parse a server JSON message and forward it to the display loop.
 async fn forward_msg(text: &str, tx: &mpsc::Sender<TranscriptMsg>) {
     match serde_json::from_str::<ServerMsg>(text) {
         Ok(ServerMsg::Partial { text, lang, rms }) => {
-            tx.send(TranscriptMsg::Partial { text, lang, rms }).await.ok();
+            tx.send(TranscriptMsg::Partial { text, lang, rms })
+                .await
+                .ok();
         }
         Ok(ServerMsg::GoldReplace { text, lang, rms }) => {
             tx.send(TranscriptMsg::Gold { text, lang, rms }).await.ok();
@@ -189,6 +278,7 @@ fn debug_tag(lang: &str, rms: f32) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let endpoint = ClientEndpoint::from_args();
     let debug_mode = std::env::args().any(|a| a == "--debug");
 
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<TranscriptMsg>(32);
@@ -237,9 +327,9 @@ async fn main() -> Result<()> {
                 match key {
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         if session.is_none() {
-                            print!("  Connecting to {WS_URL} ...");
+                            print!("  Connecting to {} ...", endpoint.description());
                             std::io::stdout().flush().ok();
-                            match start_session(transcript_tx.clone()).await {
+                            match start_session(endpoint.clone(), transcript_tx.clone()).await {
                                 Ok(s) => {
                                     session = Some(s);
                                     partials.clear();
@@ -302,6 +392,48 @@ async fn main() -> Result<()> {
 
     print!("\r\x1b[2KBye.\r\n");
     Ok(())
+}
+
+async fn read_frame<R>(reader: &mut R) -> io::Result<Option<(u8, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; 5];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some((header[0], payload)))
+}
+
+async fn write_json_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_frame(writer, FRAME_JSON, payload).await
+}
+
+async fn write_frame<W>(writer: &mut W, frame_type: u8, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(frame_type).await?;
+    writer.write_u32(payload.len() as u32).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await
+}
+
+#[cfg(unix)]
+fn default_socket_path() -> String {
+    std::env::temp_dir()
+        .join("speakboard-sidecar.sock")
+        .display()
+        .to_string()
 }
 
 /// Resample `samples` from `from_hz` to `to_hz` using linear interpolation.
