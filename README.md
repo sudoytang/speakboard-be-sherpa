@@ -13,6 +13,7 @@ A real-time Automatic Speech Recognition (ASR) server written in Rust, built on 
 - **Eager model loading** — the model is loaded once at startup and shared across all connections via `Arc<Mutex<_>>`
 - **Force-split** — if a continuous speech segment exceeds 30 s, it is split at the best-scored silence point (score = silence duration × proximity to temporal center) and flushed
 - **Multi-language** — SenseVoice supports Chinese, English, Japanese, Korean, and Cantonese with automatic language detection and Inverse Text Normalization (ITN)
+- **Sidecar wrapper** — an optional helper executable can supervise the server process and terminate it when the frontend parent disappears
 
 ## Architecture
 
@@ -74,6 +75,14 @@ cargo run --release
 
 On first launch the SenseVoice model is downloaded into `./models/` automatically. The server listens on `ws://0.0.0.0:8080/ws`.
 
+### Run the sidecar wrapper
+
+```bash
+cargo run --bin speakboard-sidecar-wrapper -- ./target/release/speakboard-be-sherpa
+```
+
+The wrapper launches the real backend child process, forwards its stdout/stderr, and watches its own `stdin`. When the parent-side pipe closes, the wrapper terminates the child process and exits.
+
 Environment variables:
 
 | Variable | Default | Description |
@@ -112,7 +121,8 @@ src/
 ├── protocol.rs      # Shared message types (ClientMessage, ServerMessage)
 ├── model_dl.rs      # Auto-download and extraction of model files
 └── bin/
-    └── client.rs    # CLI test client
+    ├── client.rs                    # CLI test client
+    └── speakboard-sidecar-wrapper.rs # Parent-liveness wrapper for sidecar cleanup
 ```
 
 ## License
