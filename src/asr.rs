@@ -58,6 +58,130 @@ struct TranscribeOutput {
     lang: String,
 }
 
+/// State accumulated across the full "gold" window since the last reset.
+struct GoldWindowState {
+    silence_regions: Vec<(usize, usize)>,
+    open_silence: Option<usize>,
+    speech_samples: usize,
+    speech_energy_sum: f64,
+    partial_emitted: bool,
+}
+
+impl GoldWindowState {
+    fn new() -> Self {
+        Self {
+            silence_regions: Vec::new(),
+            open_silence: None,
+            speech_samples: 0,
+            speech_energy_sum: 0.0,
+            partial_emitted: false,
+        }
+    }
+
+    fn record_speech(&mut self, samples: &[f32]) {
+        self.speech_samples += samples.len();
+        self.speech_energy_sum += samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>();
+    }
+
+    fn close_open_silence(&mut self, buffer_len: usize) {
+        if let Some(start) = self.open_silence.take() {
+            self.silence_regions.push((start, buffer_len));
+        }
+    }
+
+    fn ensure_open_silence(&mut self, buffer_len: usize) {
+        if self.open_silence.is_none() {
+            self.open_silence = Some(buffer_len);
+        }
+    }
+
+    fn can_attempt_final(&self, min_speech_samples: usize) -> bool {
+        self.speech_samples >= min_speech_samples || self.partial_emitted
+    }
+
+    fn reset(&mut self) {
+        self.silence_regions.clear();
+        self.open_silence = None;
+        self.speech_samples = 0;
+        self.speech_energy_sum = 0.0;
+        self.partial_emitted = false;
+    }
+
+    fn reset_after_split(
+        &mut self,
+        silence_regions: Vec<(usize, usize)>,
+        open_silence: Option<usize>,
+        speech_samples: usize,
+        speech_energy_sum: f64,
+    ) {
+        self.silence_regions = silence_regions;
+        self.open_silence = open_silence;
+        self.speech_samples = speech_samples;
+        self.speech_energy_sum = speech_energy_sum;
+        self.partial_emitted = false;
+    }
+}
+
+/// State for the currently active utterance inside the gold window.
+struct UtteranceState {
+    start: usize,
+    silence_samples: usize,
+    in_speech: bool,
+    partial_fired: bool,
+    speech_samples: usize,
+    speech_energy_sum: f64,
+}
+
+impl UtteranceState {
+    fn new() -> Self {
+        Self {
+            start: 0,
+            silence_samples: 0,
+            in_speech: false,
+            partial_fired: false,
+            speech_samples: 0,
+            speech_energy_sum: 0.0,
+        }
+    }
+
+    fn begin_speech(&mut self, buffer_len: usize) {
+        if !self.in_speech {
+            self.start = buffer_len;
+            self.speech_samples = 0;
+            self.speech_energy_sum = 0.0;
+        }
+    }
+
+    fn record_speech(&mut self, samples: &[f32]) {
+        self.speech_samples += samples.len();
+        self.speech_energy_sum += samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>();
+        self.in_speech = true;
+        self.silence_samples = 0;
+        self.partial_fired = false;
+    }
+
+    fn note_silence(&mut self, samples_len: usize) {
+        self.silence_samples += samples_len;
+    }
+
+    fn note_partial_sent(&mut self) {
+        self.in_speech = false;
+        self.partial_fired = true;
+    }
+
+    fn tracks_silence(&self) -> bool {
+        self.in_speech || self.partial_fired
+    }
+
+    fn rms(&self) -> f32 {
+        (self.speech_energy_sum / self.speech_samples.max(1) as f64).sqrt() as f32
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
 pub struct ModelPaths {
     pub model: String,
     pub tokens: String,
@@ -150,28 +274,9 @@ fn run_asr(
 
     // All audio accumulated since the last gold boundary.
     let mut gold_buffer: Vec<f32> = Vec::new();
-
-    // Detected silence intervals (sample indices within gold_buffer).
-    let mut silence_regions: Vec<(usize, usize)> = Vec::new();
-
-    // Start of the currently open (not yet closed) silence region.
-    let mut open_silence: Option<usize> = None;
-
-    // Index within gold_buffer where the current utterance started.
-    let mut utterance_start: usize = 0;
-
-    // Consecutive silence samples counted since the last speech chunk.
-    let mut silence_samples: usize = 0;
-
-    let mut in_speech = false;
-    // True once a partial has been fired for the current silence run.
-    let mut partial_fired = false;
     let mut partial_seq: u64 = 0;
-    // Actual speech samples (above threshold) in the current utterance.
-    // Used both as a noise gate and to compute the utterance RMS.
-    let mut speech_samples_in_utterance: usize = 0;
-    // Sum of squared samples for speech chunks — used to compute RMS.
-    let mut speech_energy_sum: f64 = 0.0;
+    let mut window = GoldWindowState::new();
+    let mut utterance = UtteranceState::new();
 
     info!(
         "ASR thread started (partial={:.1}s  gold={:.1}s  cap={:.0}s)",
@@ -192,94 +297,99 @@ fn run_asr(
                 // Print a status line every 50 chunks (~1.6 s at typical rates).
                 if chunk_count % 50 == 0 {
                     let gold_s = gold_buffer.len() as f32 / SAMPLE_RATE as f32;
-                    let sil_s = silence_samples as f32 / SAMPLE_RATE as f32;
+                    let sil_s = utterance.silence_samples as f32 / SAMPLE_RATE as f32;
                     debug!(
                         "chunk#{chunk_count}  rms={energy:.4}  in_speech={in_speech}  \
                          silence={sil_s:.2}s  gold_buf={gold_s:.2}s  partial_fired={partial_fired}"
+                    ,
+                        in_speech = utterance.in_speech,
+                        partial_fired = utterance.partial_fired,
                     );
                 }
 
                 trace!(
                     "chunk  rms={energy:.4}  is_speech={is_speech}  \
                      silence_s={:.2}  gold_s={:.2}",
-                    silence_samples as f32 / SAMPLE_RATE as f32,
+                    utterance.silence_samples as f32 / SAMPLE_RATE as f32,
                     gold_buffer.len() as f32 / SAMPLE_RATE as f32,
                 );
 
                 if is_speech {
                     // ── entering / continuing speech ──────────────────────────
-                    if let Some(start) = open_silence.take() {
-                        silence_regions.push((start, gold_buffer.len()));
-                    }
-                    if !in_speech {
-                        utterance_start = gold_buffer.len();
-                        speech_samples_in_utterance = 0;
-                        speech_energy_sum = 0.0;
+                    window.close_open_silence(gold_buffer.len());
+                    if !utterance.in_speech {
+                        utterance.begin_speech(gold_buffer.len());
                         debug!(
                             "speech started  utterance_start={}  gold_buf={:.2}s",
-                            utterance_start,
+                            utterance.start,
                             gold_buffer.len() as f32 / SAMPLE_RATE as f32,
                         );
                     }
-                    speech_samples_in_utterance += samples.len();
-                    speech_energy_sum +=
-                        samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>();
+                    utterance.record_speech(&samples);
+                    window.record_speech(&samples);
                     gold_buffer.extend_from_slice(&samples);
-                    in_speech = true;
-                    silence_samples = 0;
-                    partial_fired = false;
 
                     // Hard cap: force-flush if gold_buffer exceeds the cap.
                     if gold_buffer.len() >= cfg.max_gold_samples {
-                        let split = best_split(&silence_regions, gold_buffer.len());
+                        let split = best_split(&window.silence_regions, gold_buffer.len());
                         info!("force-split at {:.2}s", split as f32 / SAMPLE_RATE as f32);
                         let right = gold_buffer[split..].to_vec();
 
-                        if let Some(out) = transcribe(&recognizer, &gold_buffer[..split], cfg.min_transcribe_samples) {
-                            let split_rms = (speech_energy_sum
-                                / speech_samples_in_utterance.max(1) as f64)
-                                .sqrt() as f32;
-                            let _ = result_tx.blocking_send(AsrResult::GoldReplace {
-                                text: out.text,
-                                lang: out.lang,
-                                rms: split_rms,
-                            });
+                        if window.can_attempt_final(cfg.min_speech_samples) {
+                            if let Some(out) = transcribe(&recognizer, &gold_buffer[..split], cfg.min_transcribe_samples) {
+                                let split_rms = utterance.rms();
+                                let _ = result_tx.blocking_send(AsrResult::GoldReplace {
+                                    text: out.text,
+                                    lang: out.lang,
+                                    rms: split_rms,
+                                });
+                            }
                         }
 
-                        silence_regions = silence_regions
+                        let silence_regions = window
+                            .silence_regions
                             .iter()
                             .filter(|&&(_, e)| e > split)
                             .map(|&(s, e)| (s.saturating_sub(split), e - split))
                             .collect();
-                        if let Some(ref mut start) = open_silence {
-                            *start = start.saturating_sub(split);
+                        let open_silence = window.open_silence.map(|start| start.saturating_sub(split));
+
+                        let retained_utterance = utterance.start >= split;
+                        utterance.start = utterance.start.saturating_sub(split);
+                        if !retained_utterance {
+                            utterance.speech_samples = 0;
+                            utterance.speech_energy_sum = 0.0;
                         }
-                        utterance_start = utterance_start.saturating_sub(split);
+
                         gold_buffer = right;
+                        window.reset_after_split(
+                            silence_regions,
+                            open_silence,
+                            utterance.speech_samples,
+                            utterance.speech_energy_sum,
+                        );
                     }
-                } else if in_speech || partial_fired {
+                } else if utterance.tracks_silence() {
                     // ── silence after speech (or after partial was sent) ──────
-                    if open_silence.is_none() {
-                        open_silence = Some(gold_buffer.len());
+                    if window.open_silence.is_none() {
+                        window.ensure_open_silence(gold_buffer.len());
                         debug!(
                             "silence started  gold_buf={:.2}s",
                             gold_buffer.len() as f32 / SAMPLE_RATE as f32,
                         );
                     }
                     gold_buffer.extend_from_slice(&samples);
-                    silence_samples += samples.len();
+                    utterance.note_silence(samples.len());
 
                     // partial threshold
-                    if silence_samples >= cfg.partial_silence_samples && !partial_fired {
-                        let sil_s = silence_samples as f32 / SAMPLE_RATE as f32;
-                        let utt_s = (gold_buffer.len() - utterance_start) as f32 / SAMPLE_RATE as f32;
-                        let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
+                    if utterance.silence_samples >= cfg.partial_silence_samples && !utterance.partial_fired {
+                        let sil_s = utterance.silence_samples as f32 / SAMPLE_RATE as f32;
+                        let utt_s = (gold_buffer.len() - utterance.start) as f32 / SAMPLE_RATE as f32;
+                        let speech_s = utterance.speech_samples as f32 / SAMPLE_RATE as f32;
                         info!("PARTIAL threshold hit  silence={sil_s:.2}s  utterance={utt_s:.2}s  speech={speech_s:.2}s");
-                        if speech_samples_in_utterance >= cfg.min_speech_samples {
-                            let utterance_rms = (speech_energy_sum
-                                / speech_samples_in_utterance as f64)
-                                .sqrt() as f32;
-                            let utterance_audio = &gold_buffer[utterance_start..];
+                        if utterance.speech_samples >= cfg.min_speech_samples {
+                            let utterance_rms = utterance.rms();
+                            let utterance_audio = &gold_buffer[utterance.start..];
                             if let Some(out) = transcribe(&recognizer, utterance_audio, cfg.min_transcribe_samples) {
                                 let id = format!("p{partial_seq}");
                                 partial_seq += 1;
@@ -293,50 +403,40 @@ fn run_asr(
                                     lang: out.lang,
                                     rms: utterance_rms,
                                 });
+                                window.partial_emitted = true;
                             }
                         } else {
                             debug!("PARTIAL skipped: speech too short ({speech_s:.2}s), likely noise");
                         }
-                        in_speech = false;
-                        partial_fired = true;
+                        utterance.note_partial_sent();
                     }
 
                     // gold threshold
-                    if silence_samples >= cfg.gold_silence_samples {
-                        let sil_s = silence_samples as f32 / SAMPLE_RATE as f32;
+                    if utterance.silence_samples >= cfg.gold_silence_samples {
+                        let sil_s = utterance.silence_samples as f32 / SAMPLE_RATE as f32;
                         let gold_s = gold_buffer.len() as f32 / SAMPLE_RATE as f32;
-                        let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
+                        let speech_s = window.speech_samples as f32 / SAMPLE_RATE as f32;
                         info!("GOLD threshold hit  silence={sil_s:.2}s  gold_buf={gold_s:.2}s  speech={speech_s:.2}s");
-                        if let Some(start) = open_silence.take() {
-                            silence_regions.push((start, gold_buffer.len()));
-                        }
-                        if speech_samples_in_utterance >= cfg.min_speech_samples {
-                            let utterance_rms = (speech_energy_sum
-                                / speech_samples_in_utterance as f64)
-                                .sqrt() as f32;
+                        window.close_open_silence(gold_buffer.len());
+                        if window.can_attempt_final(cfg.min_speech_samples) {
+                            let window_rms = utterance.rms();
                             if let Some(out) = transcribe(&recognizer, &gold_buffer, cfg.min_transcribe_samples) {
                                 info!(
-                                    "→ sending GoldReplace  lang={}  rms={utterance_rms:.4}  text=\"{}\"",
+                                    "→ sending GoldReplace  lang={}  rms={window_rms:.4}  text=\"{}\"",
                                     out.lang, out.text
                                 );
                                 let _ = result_tx.blocking_send(AsrResult::GoldReplace {
                                     text: out.text,
                                     lang: out.lang,
-                                    rms: utterance_rms,
+                                    rms: window_rms,
                                 });
                             }
                         } else {
                             debug!("GOLD skipped: speech too short ({speech_s:.2}s), likely noise");
                         }
                         gold_buffer.clear();
-                        silence_regions.clear();
-                        open_silence = None;
-                        utterance_start = 0;
-                        in_speech = false;
-                        silence_samples = 0;
-                        partial_fired = false;
-                        speech_samples_in_utterance = 0;
-                        speech_energy_sum = 0.0;
+                        window.reset();
+                        utterance.reset();
                         debug!("gold boundary reset");
                     }
                 } else {
@@ -347,26 +447,22 @@ fn run_asr(
 
             Some(AudioMsg::Stop) | None => {
                 let gold_s = gold_buffer.len() as f32 / SAMPLE_RATE as f32;
-                info!("Stop received  gold_buf={gold_s:.2}s  in_speech={in_speech}");
-                if let Some(start) = open_silence.take() {
-                    silence_regions.push((start, gold_buffer.len()));
-                }
+                info!("Stop received  gold_buf={gold_s:.2}s  in_speech={}", utterance.in_speech);
+                window.close_open_silence(gold_buffer.len());
                 if !gold_buffer.is_empty() {
-                    let speech_s = speech_samples_in_utterance as f32 / SAMPLE_RATE as f32;
-                    if speech_samples_in_utterance >= cfg.min_speech_samples {
-                        let utterance_rms = (speech_energy_sum
-                            / speech_samples_in_utterance as f64)
-                            .sqrt() as f32;
+                    let speech_s = window.speech_samples as f32 / SAMPLE_RATE as f32;
+                    if window.can_attempt_final(cfg.min_speech_samples) {
+                        let final_rms = utterance.rms();
                         info!("flushing remaining {gold_s:.2}s as final gold");
                         if let Some(out) = transcribe(&recognizer, &gold_buffer, cfg.min_transcribe_samples) {
                             info!(
-                                "→ sending GoldReplace (flush)  lang={}  rms={utterance_rms:.4}  text=\"{}\"",
+                                "→ sending GoldReplace (flush)  lang={}  rms={final_rms:.4}  text=\"{}\"",
                                 out.lang, out.text
                             );
                             let _ = result_tx.blocking_send(AsrResult::GoldReplace {
                                 text: out.text,
                                 lang: out.lang,
-                                rms: utterance_rms,
+                                rms: final_rms,
                             });
                         }
                     } else {
